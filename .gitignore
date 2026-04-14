@@ -1,4 +1,5 @@
 .vscode/
-.requirements.txt/
-.gitignore/
 __pycache__/
+.venv/
+livros.db
+poetry.lock
