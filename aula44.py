@@ -3,7 +3,16 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from typing import Optional
 import secrets
-import os
+
+from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+
+DATABASE_URL = "sqlite:///./livros.db"
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
 
 app = FastAPI(
     title="API de Livros",
@@ -22,10 +31,26 @@ security = HTTPBasic()
 
 meus_livroz = {}
 
+class LivroDB(Base):
+    __tablename__ = "livros"
+    id = Column(Integer, primary_key=True, index=True)
+    nome_livro = Column(String, index=True)
+    autor_livro = Column(String, index=True)
+    ano_livro = Column(Integer)
+    
 class Livro(BaseModel):
     nome_livro: str
     autor_livro: str
     ano_livro: int
+
+Base.metadata.create_all(bind=engine)
+
+def sessao_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 def autenticar_meu_usuario(credentials: HTTPBasicCredentials = Depends(security)):
     is_username_correct = secrets.compare_digest(credentials.username, MEU_USUARIO)
@@ -34,60 +59,71 @@ def autenticar_meu_usuario(credentials: HTTPBasicCredentials = Depends(security)
     if not (is_username_correct and is_password_correct):
         raise HTTPException(
             status_code=401,
-            detail="Usuário ou senha incorretos",
+            detail="Usuario não autorizado!",
             headers={"WWW-Authenticate": "Basic"}
-        )
+            )
+
+    return credentials
 
 @app.get("/")
 def hello_world():
     return {"Hello": "World!"}
 
 @app.get("/livros")
-def get_livros(page: int = 1, limit = 10, credentials: HTTPBasicCredentials = Depends(autenticar_meu_usuario)):
+def get_livros(page: int = 1, limit: int = 10, db: Session = Depends(sessao_db) , credentials: HTTPBasicCredentials = Depends(autenticar_meu_usuario)):
     if page < 1 or limit < 1:
         raise HTTPException(status_code=400, detail="Page or limit inválidos!")
+    
+    livros = db.query(LivroDB).offset((page - 1) * limit).limit(limit).all()
 
-    if not meus_livroz:
+    if not livros:
         return {"message": "Não existe nenhum livro!"}
     
-    start = (page - 1) * limit
-    end = start + limit
-
-    livros_paginados = [
-        {"id": id_livro, "nome_livro": livro_data["nome_livro"], "autor_livro": livro_data["autor_livro"], "ano_livro": livro_data["ano_livro"]}
-        for id_livro, livro_data in list(meus_livroz.items())[start:end]
-    ]
+    total_livros = db.query(LivroDB).count()
 
     return {
         "page": page,
         "limit": limit,
-        "total": len(meus_livroz),
-        "livros": livros_paginados
+        "total": total_livros,
+        "livros": [{"id": livro.id, "nome_livro": livro.nome_livro, "autor_livro": livro.autor_livro, "ano_livro": livro.ano_livro} for livro in livros] 
     }
     
 @app.post("/adiciona")
-def post_livros(id_livro: int, livro: Livro, credentials: HTTPBasicCredentials = Depends(autenticar_meu_usuario)):
-    if id_livro in meus_livroz:
+def post_livros(livro: Livro, db: Session = Depends(sessao_db) , credentials: HTTPBasicCredentials = Depends(autenticar_meu_usuario)):
+    db_livro = db.query(LivroDB).filter(LivroDB.nome_livro == livro.nome_livro, LivroDB.autor_livro == livro.autor_livro).first()
+    if db_livro: 
         raise HTTPException(status_code=400, detail="Esse livro já está cadastrado!")
-    else:
-        meus_livroz[id_livro] = livro.model_dump()
-        return {"message": "O livro foi adicionado com sucesso!"}
+    
+    novo_livro = LivroDB(nome_livro=livro.nome_livro, autor_livro=livro.autor_livro, ano_livro=livro.ano_livro)
+    db.add(novo_livro)
+    db.commit()
+    db.refresh(novo_livro)
+
+    return {"message": "O livro foi criado com sucesso"}
     
 @app.put("/atualiza/{id_livro}")
-def put_livros(id_livro: int, livro: Livro, credentials: HTTPBasicCredentials = Depends(autenticar_meu_usuario)):
-    meu_livro = meus_livroz.get(id_livro)
-    if not meu_livro:
+def put_livros(id_livro: int, livro: Livro, db: Session = Depends(sessao_db), credentials: HTTPBasicCredentials = Depends(autenticar_meu_usuario)):
+    db_livro = db.query(LivroDB).filter(LivroDB.id == id_livro).first()
+    if not db_livro:
         raise HTTPException(status_code=404, detail="Esse livro não foi encontrado!")
-    else:
-        meus_livroz[id_livro] = livro.model_dump()
-        
-        return {"message": "As informações do seu livro foram atualizadas com sucesso!"}
+    
+    db_livro.nome_livro = livro.nome_livro
+    db_livro.autor_livro = livro.autor_livro
+    db_livro.ano_livro = livro.ano_livro
+
+    db.commit()
+    db.refresh(db_livro)
+
+    return {"message": "O livro foi atualizado com sucesso!"}
 
 @app.delete("/deletar/{id_livro}")
-def delete_livro(id_livro: int, credentials: HTTPBasicCredentials = Depends(autenticar_meu_usuario)):
-    if id_livro not in meus_livroz:
-        raise HTTPException(status_code=404, detail="Esse livro não foi encontrado!")
-    else:
-        del meus_livroz[id_livro]
+def delete_livro(id_livro: int, db: Session = Depends(sessao_db), credentials: HTTPBasicCredentials = Depends(autenticar_meu_usuario)):
+        db_livro = db.query(LivroDB).filter(LivroDB.id == id_livro).first()
+
+        if not db_livro:
+            raise HTTPException(status_code=404, detail="Esse livro não foi encontrado!")
+
+        db.delete(db_livro)
+        db.commit()
 
         return {"message": "Livro deletado com sucesso!!"}
